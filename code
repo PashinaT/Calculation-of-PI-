@@ -1,0 +1,150 @@
+#include <cstdlib>
+#include <cuda.h>
+#include <stdio.h>
+#include <iostream>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+#include <curand.h>
+#include <stdio.h>
+#include <math.h>
+// чтобы VS не ругался на __syncthreads();
+//доп. инфа здесь https://devtalk.nvidia.com/default/topic/1009723/__syncthreads-and-atomicadd-are-undefined-in-visual-studio-2015/ 
+#ifndef __CUDACC__  
+#define __CUDACC__
+#endif
+
+#include "cuda_runtime.h"
+#include <curand_kernel.h>
+#include <device_functions.h> 
+#include "device_launch_parameters.h"
+
+
+const long N = 2097152;
+
+
+float piCPU(float *x, float *y) {
+	int countPointsInCircle = 0; //Кол-во точек в круге
+	for (int i = 0; i < N; i++) {
+		if (x[i] * x[i] + y[i] * y[i] < 1) {
+			countPointsInCircle++;
+		}
+	}
+	return float(countPointsInCircle) * 4 / N;
+}
+
+
+__global__ void piGPU(float *x, float *y, int *blocksCounts) {
+
+	int idx = blockIdx.x * blockDim.x + threadIdx.x; // номер элемента
+
+	int bias = gridDim.x * blockDim.x;// cмещение по векторам
+	
+	//каждый поток будет записывать количесто точек пренадлежащих окружности
+	__shared__ int sharedCounts[512]; 
+
+	int countPointsInCircle = 0;
+	for (int i = idx; i < N; i += bias) {
+		if (x[i] * x[i] + y[i] * y[i] < 1) {
+			countPointsInCircle++;
+		}
+	}
+	sharedCounts[threadIdx.x] = countPointsInCircle;
+
+	__syncthreads();
+
+	// Первый поток каждого block`а будет вычислять суммарное количество точек, попавших в круг в каждом блоке 
+	if (threadIdx.x == 0) {
+		int total = 0;
+		for (int j = 0; j < 512; j++) {
+			total += sharedCounts[j];
+		}
+		blocksCounts[blockIdx.x] = total;
+	}
+}
+
+
+int main()
+{
+	setlocale(LC_ALL, "RUS");
+	float *X, *Y, *devX, *devY;
+
+	X = (float *)calloc(N, sizeof(float));
+	Y = (float *)calloc(N, sizeof(float));
+  
+	cudaMalloc((void **)&devX, N * sizeof(float));
+	cudaMalloc((void **)&devY, N * sizeof(float));
+
+	curandGenerator_t curandGenerator;
+	curandCreateGenerator(&curandGenerator, CURAND_RNG_PSEUDO_MRG32K3A); 
+	curandSetPseudoRandomGeneratorSeed(curandGenerator, 1234ULL); 
+  curandGenerateUniform(curandGenerator, devX, N); 
+  curandGenerateUniform(curandGenerator, devY, N);
+	curandDestroyGenerator(curandGenerator); 
+  
+	cudaMemcpy(X, devX, N * sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(Y, devY, N * sizeof(float), cudaMemcpyDeviceToHost);
+
+	clock_t  start_time = clock();
+    float cpu_result = piCPU(X, Y);
+	clock_t  end_time = clock();
+	std::cout << "Время на CPU = " << (double)((end_time - start_time) * 1000 / CLOCKS_PER_SEC) << " мсек" << std::endl;
+	std::cout << "result CPU: " << cpu_result << std::endl;
+	
+	int *dev_blocks_counts = 0, *blocks_counts = 0;
+	float gpuTime = 0;
+
+	cudaEvent_t start;
+	cudaEvent_t stop;
+
+	int blockDim = 512; // размер одного блока в потоках
+	int gridDim = N / (128 * blockDim); // размер сетки
+
+
+	blocks_counts = (int *)calloc(gridDim, sizeof(int));
+
+	cudaMalloc((void **)&dev_blocks_counts, 512 * sizeof(int));
+
+	cudaEventCreate(&start);
+	cudaEventCreate(&stop);
+  
+	
+	cudaEventRecord(start, 0);
+
+	piGPU << <gridDim, blockDim >> >(devX, devY, dev_blocks_counts);
+
+	cudaMemcpy(blocks_counts, dev_blocks_counts, gridDim * sizeof(int), cudaMemcpyDeviceToHost);
+
+	int countPointsInCircle = 0;
+	for (int i = 0; i < gridDim; i++) {
+		countPointsInCircle += blocks_counts[i];
+	}
+
+
+	float gpu_result = (float) countPointsInCircle * 4 / N;
+
+	cudaEventRecord(stop, 0);
+
+	
+	cudaEventSynchronize(stop);
+
+
+	cudaEventElapsedTime(&gpuTime, start, stop);
+
+	std::cout << "Время на GPU = " << gpuTime << " мсек" << std::endl;
+	std::cout << "result: " << gpu_result << std::endl;
+
+
+	cudaEventDestroy(start);
+	cudaEventDestroy(stop);
+
+	cudaFree(devX);
+	cudaFree(devY);
+	cudaFree(dev_blocks_counts);
+
+	delete X;
+	delete Y;
+
+	system("pause");
+	return 0;
+}
